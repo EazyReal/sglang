@@ -1,5 +1,5 @@
 import logging
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -274,7 +274,10 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        super().load_weights(weights, is_nextn=True)
+        return super().load_weights(weights, is_nextn=True)
+
+    def verify_weights_loaded(self, loaded_params: Set[str]) -> None:
+        super().verify_weights_loaded(loaded_params, is_nextn=True)
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         super().post_load_weights(is_nextn=True, weight_names=weight_names)

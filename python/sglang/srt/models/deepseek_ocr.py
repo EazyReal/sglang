@@ -1852,12 +1852,15 @@ class DeepseekOCRForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
-        unloaded_params = params_dict.keys() - loaded_params
+        self.post_load_weights()
+        return loaded_params
+
+    def verify_weights_loaded(self, loaded_params: Set[str]) -> None:
+        unloaded_params = set(dict(self.named_parameters()).keys()) - loaded_params
         if unloaded_params:
             raise RuntimeError(
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
-        self.post_load_weights()
 
     def post_load_weights(self):
         if _is_cpu and _is_cpu_amx_available:

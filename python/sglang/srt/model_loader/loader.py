@@ -305,6 +305,17 @@ def _post_load_weights(model: nn.Module) -> None:
         model.post_load_weights()
 
 
+def _load_and_verify_weights(model: nn.Module, weights) -> Optional[set]:
+    # Load a full checkpoint, then run the model's completeness check if it defines one.
+    # The check lives in `verify_weights_loaded` (not in `load_weights`) so it only runs on
+    # full loads. Online weight-update paths call `model.load_weights()` directly and skip
+    # it, since they intentionally pass partial weight slices.
+    loaded_params = model.load_weights(weights)
+    if loaded_params is not None and hasattr(model, "verify_weights_loaded"):
+        model.verify_weights_loaded(loaded_params)
+    return loaded_params
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -770,12 +781,12 @@ class DefaultModelLoader(BaseModelLoader):
                 TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
                 FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
             ):
-                model.load_weights(weights)
+                _load_and_verify_weights(model, weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         else:
-            model.load_weights(weights)
+            _load_and_verify_weights(model, weights)
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
@@ -1965,7 +1976,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             model_config.model_path, model_config.revision, pre_quant, load_8bit
         )
 
-        model.load_weights(qweight_iterator)
+        _load_and_verify_weights(model, qweight_iterator)
 
         current_platform.empty_cache()
 
@@ -2157,8 +2168,9 @@ class GGUFModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
-            model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
+            _load_and_verify_weights(
+                model,
+                self._get_weights_iterator(local_model_path, gguf_weights_map),
             )
 
             for _, module in model.named_modules():
@@ -2472,7 +2484,7 @@ class RemoteModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
-            model.load_weights(self._get_weights_iterator_fs(client))
+            _load_and_verify_weights(model, self._get_weights_iterator_fs(client))
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -2542,7 +2554,7 @@ def load_model_with_cpu_quantization(
         )
 
         if not isinstance(self, DummyModelLoader):
-            model.load_weights(self._get_all_weights(model_config, model))
+            _load_and_verify_weights(model, self._get_all_weights(model_config, model))
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)

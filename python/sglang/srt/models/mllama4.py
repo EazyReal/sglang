@@ -681,7 +681,10 @@ class Llama4ForConditionalGeneration(nn.Module):
 
             loaded_params.add(name)
             self._handle_default_weight(name, loaded_weight, params_dict)
-        unloaded_params = params_dict.keys() - loaded_params
+        return loaded_params
+
+    def verify_weights_loaded(self, loaded_params: Set[str]) -> None:
+        unloaded_params = set(dict(self.named_parameters()).keys()) - loaded_params
         if unloaded_params:
             logger.warning(
                 f"Some weights are not initialized from checkpoints {unloaded_params}"

@@ -2309,9 +2309,16 @@ class DeepseekV4ForCausalLM(nn.Module):
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
-        assert len(cache_compressor_weight) == 0
-        assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
-        unloaded_params = params_dict.keys() - loaded_params
+        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        return loaded_params
+
+    def verify_weights_loaded(
+        self, loaded_params: Set[str], *, is_nextn: bool = False
+    ) -> None:
+        # Fail fast on uninitialized parameters, like vLLM's loader-side check. This also
+        # covers fused compressor / wqkv_a targets: a half-delivered pair leaves its target
+        # param unloaded, replacing the old post-loop asserts.
+        unloaded_params = set(dict(self.named_parameters()).keys()) - loaded_params
 
         skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
         if not self.pp_group.is_first_rank:
@@ -2330,11 +2337,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         }
         if unloaded_params:
-            logger.warning(
+            raise RuntimeError(
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
-
-        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

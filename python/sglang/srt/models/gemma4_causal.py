@@ -129,6 +129,46 @@ def pp_filter_load_weight(
     return False
 
 
+def log_unloaded_params(load_logger, model, loaded_params: Set[str]) -> None:
+    """Log parameters/buffers a full checkpoint did not initialize, bucketed by kind.
+
+    Real parameters missing from the checkpoint are a likely problem (WARNING);
+    persistent buffers fall back to default init (INFO); non-persistent buffers are
+    expected to be absent (DEBUG). The loader calls this after a full load only.
+    """
+    params_dict = dict(model.named_parameters())
+    params_dict.update(dict(model.named_buffers()))
+    unloaded_params = params_dict.keys() - loaded_params
+    if not unloaded_params:
+        return
+
+    param_names = set(dict(model.named_parameters()).keys())
+    non_persistent_buffers: Set[str] = set()
+    for mod_name, mod in model.named_modules():
+        for buf_name in getattr(mod, "_non_persistent_buffers_set", set()):
+            full = f"{mod_name}.{buf_name}" if mod_name else buf_name
+            non_persistent_buffers.add(full)
+
+    buckets = {
+        logging.WARNING: (
+            "Some weights are not initialized from checkpoints",
+            lambda p: p in param_names,
+        ),
+        logging.INFO: (
+            "Persistent buffers not in checkpoint (using default init)",
+            lambda p: p not in param_names and p not in non_persistent_buffers,
+        ),
+        logging.DEBUG: (
+            "Non-persistent buffers not in checkpoint (expected)",
+            lambda p: p in non_persistent_buffers,
+        ),
+    }
+    for level, (msg, pred) in buckets.items():
+        names = sorted(p for p in unloaded_params if pred(p))
+        if names:
+            load_logger.log(level, "%s: %s", msg, names)
+
+
 class Gemma4Router(nn.Module):
     """Router for Gemma4 MoE that preprocesses input before projection.
 
@@ -1213,11 +1253,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
 
         params_dict = dict(self.named_parameters())
         params_dict.update(dict(self.named_buffers()))
-        non_persistent_buffers: Set[str] = set()
-        for mod_name, mod in self.named_modules():
-            for buf_name in getattr(mod, "_non_persistent_buffers_set", set()):
-                full = f"{mod_name}.{buf_name}" if mod_name else buf_name
-                non_persistent_buffers.add(full)
 
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
@@ -1341,28 +1376,10 @@ class Gemma4ForCausalLM(PreTrainedModel):
                         )
                         weight_loader(param, loaded_weight)
                         loaded_params.add(name)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            param_names = set(dict(self.named_parameters()).keys())
-            buckets = {
-                logging.WARNING: (
-                    "Some weights are not initialized from checkpoints",
-                    lambda p: p in param_names,
-                ),
-                logging.INFO: (
-                    "Persistent buffers not in checkpoint (using default init)",
-                    lambda p: p not in param_names and p not in non_persistent_buffers,
-                ),
-                logging.DEBUG: (
-                    "Non-persistent buffers not in checkpoint (expected)",
-                    lambda p: p in non_persistent_buffers,
-                ),
-            }
-            for level, (msg, pred) in buckets.items():
-                names = sorted(p for p in unloaded_params if pred(p))
-                if names:
-                    logger.log(level, "%s: %s", msg, names)
         return loaded_params
+
+    def verify_weights_loaded(self, loaded_params: Set[str]) -> None:
+        log_unloaded_params(logger, self, loaded_params)
 
     def _shard_weight(self, weight: torch.Tensor) -> torch.Tensor:
         """Shard a full embedding/lm_head weight along vocab dim for the current TP rank.

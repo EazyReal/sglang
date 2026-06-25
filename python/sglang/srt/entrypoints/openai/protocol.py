@@ -792,6 +792,19 @@ class ChatCompletionRequest(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def check_top_logprobs(cls, values):
+        if (
+            values.get("top_logprobs") is not None
+            and values["top_logprobs"] > 0
+            and not values.get("logprobs")
+        ):
+            raise ValueError(
+                "when using `top_logprobs`, `logprobs` must be set to true."
+            )
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
         r = values.get("reasoning")
 

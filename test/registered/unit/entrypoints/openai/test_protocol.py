@@ -125,6 +125,21 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.stream)  # default
         self.assertEqual(request.tool_choice, "none")  # default when no tools
 
+    def test_top_logprobs_requires_logprobs(self):
+        """top_logprobs without logprobs=true must be rejected (matches vLLM)."""
+        messages = [{"role": "user", "content": "hi"}]
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(messages=messages, top_logprobs=5)
+
+    def test_top_logprobs_with_logprobs_ok(self):
+        """top_logprobs is accepted when logprobs=true."""
+        messages = [{"role": "user", "content": "hi"}]
+        request = ChatCompletionRequest(
+            messages=messages, logprobs=True, top_logprobs=5
+        )
+        self.assertTrue(request.logprobs)
+        self.assertEqual(request.top_logprobs, 5)
+
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
             model="x",

@@ -551,6 +551,24 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.session_params, [{"id": "session1"}, {"id": "session2"}])
 
+    def test_session_id_handling(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            session_id="session1",
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.session_id, "session1")
+        self.assertIsNone(req.session_params)
+        self.assertEqual(req[2].session_id, "session1")
+
+        with self.assertRaisesRegex(ValueError, "cannot both be set"):
+            GenerateReqInput(
+                text="Hello",
+                session_id="explicit",
+                session_params={"id": "legacy"},
+            ).normalize_batch_and_arguments()
+
     def test_getitem_method(self):
         """Test the __getitem__ method."""
         req = GenerateReqInput(
@@ -589,6 +607,41 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(item0.lora_path, "path1")
         self.assertEqual(item0.custom_logit_processor, "processor1")
         self.assertEqual(item0.return_hidden_states, True)
+
+    def test_getitem_session_params_per_sample(self):
+        """#27218: a list-valued session_params is indexed per subrequest; a
+        scalar dict is forwarded whole."""
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            session_params=[{"id": "s1"}, {"id": "s2"}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].session_params, {"id": "s1"})
+        self.assertEqual(req[1].session_params, {"id": "s2"})
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params={"n": 3},
+            rid=["id1", "id2"],
+            session_params=[{"id": "s1"}, {"id": "s2"}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].session_params, {"id": "s1"})
+        self.assertEqual(req[1].session_params, {"id": "s2"})
+        self.assertEqual(req[2].session_params, {"id": "s1"})
+        self.assertEqual(req[5].session_params, {"id": "s2"})
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            session_params={"id": "shared"},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].session_params, {"id": "shared"})
+        self.assertEqual(req[1].session_params, {"id": "shared"})
 
     def test_getitem_preserves_return_prompt_token_ids(self):
         """Batch subrequests must keep the prompt-token-id return flag."""

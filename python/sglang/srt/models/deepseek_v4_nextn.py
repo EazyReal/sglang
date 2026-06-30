@@ -23,6 +23,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_round_robin_input_ids,
@@ -91,15 +92,17 @@ class DeepseekV4ModelNextN(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("h_proj", prefix),
         )
-
-        layer_name = "decoder"
+        if isinstance(quant_config, ModelSlimConfig):
+            prefix = "mtp.0"
+        else:
+            prefix = add_prefix("decoder", prefix)
 
         self.decoder = DeepseekV4DecoderLayer(
             config,
             layer_id=0,
             quant_config=quant_config,
             is_nextn=True,
-            prefix=add_prefix(layer_name, prefix),
+            prefix=prefix,
             alt_streams=None,
             compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER,
         )
@@ -272,7 +275,12 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        super().load_weights(weights, is_nextn=True)
+        return super().load_weights(weights, is_nextn=True)
+
+    def is_optional_weight(self, name: str) -> bool:
+        if "lm_head" in name or "embed_tokens" in name:
+            return True
+        return super().is_optional_weight(name)
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         super().post_load_weights(is_nextn=True, weight_names=weight_names)

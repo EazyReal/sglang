@@ -16,6 +16,7 @@ import math
 import os
 import re
 import socket
+import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -42,6 +43,10 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
+)
+from sglang.srt.model_loader.weight_completeness import (
+    required_weight_names,
+    unloaded_required_params,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_available_gpu_memory
@@ -324,6 +329,25 @@ def _post_load_weights(model: nn.Module) -> None:
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+
+
+def _not_optional(name: str) -> bool:
+    return False
+
+
+def _load_and_verify_weights(model: nn.Module, weights) -> Optional[set]:
+    loaded_params = model.load_weights(weights)
+    if loaded_params is None or not getattr(model, "verify_weights_on_load", False):
+        return loaded_params
+    is_optional = getattr(model, "is_optional_weight", _not_optional)
+    missing = unloaded_required_params(
+        required_weight_names(model), loaded_params, is_optional
+    )
+    if missing:
+        raise RuntimeError(
+            f"Some weights are not initialized from checkpoints: {sorted(missing)}"
+        )
+    return loaded_params
 
 
 class BaseModelLoader(ABC):
@@ -791,12 +815,12 @@ class DefaultModelLoader(BaseModelLoader):
                 TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1",
                 FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
             ):
-                model.load_weights(weights)
+                _load_and_verify_weights(model, weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         else:
-            model.load_weights(weights)
+            _load_and_verify_weights(model, weights)
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
@@ -985,15 +1009,14 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         def load_weights_proxy(weights):
             if QuantizedRLModelLoader.is_reload_scenario(model):
                 logger.info("[QuantizedRL] Using fast path reload in load_weights")
-                QuantizedRLModelLoader.rebinding_and_load_weights(
+                return QuantizedRLModelLoader.rebinding_and_load_weights(
                     model, original_load_weights, weights
                 )
-            else:
-                original_load_weights(weights)
+            return original_load_weights(weights)
 
         model.load_weights = load_weights_proxy
 
-        model.load_weights(weights)
+        _load_and_verify_weights(model, weights)
         original_weights = dict(model.named_parameters())
 
         # Record pre-quantization state (shape/stride) for torch.as_strided reset
@@ -1859,7 +1882,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if self._is_4bit_weight_name(weight_name):
                 continue
 
@@ -1883,7 +1905,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if any(
                 target_module in weight_name for target_module in self.target_modules
             ) and weight_name.endswith(".weight"):
@@ -1893,7 +1914,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     module in weight_name
                     for module in self.column_parallel_weights_modules
                 ):
-
                     total_size = weight_tensor.size(-1)
                     start_index = total_size // tp_size * tp_rank
                     end_index = total_size // tp_size * (tp_rank + 1)
@@ -1954,7 +1974,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         self.model_type = type(model).__name__
 
         logger.info(
-            "Loading weights with BitsAndBytes quantization. " " May take a while ..."
+            "Loading weights with BitsAndBytes quantization.  May take a while ..."
         )
 
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
@@ -1966,8 +1986,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 pre_quant = True
             else:
                 raise ValueError(
-                    f"BitsAndBytes loader does not support {quant_method} "
-                    "quantization"
+                    f"BitsAndBytes loader does not support {quant_method} quantization"
                 )
 
         # The quant_states in pre_quantized models cannot work with a split
@@ -1986,7 +2005,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             model_config.model_path, model_config.revision, pre_quant, load_8bit
         )
 
-        model.load_weights(qweight_iterator)
+        _load_and_verify_weights(model, qweight_iterator)
 
         current_platform.empty_cache()
 
@@ -2178,8 +2197,9 @@ class GGUFModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
-            model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
+            _load_and_verify_weights(
+                model,
+                self._get_weights_iterator(local_model_path, gguf_weights_map),
             )
 
             for _, module in model.named_modules():
@@ -2475,7 +2495,7 @@ class RemoteModelLoader(BaseModelLoader):
                     param_data = param_data.narrow(dim, 0, size)
             if tensor.shape != param_shape:
                 logger.warning(
-                    "loading tensor of shape %s into " "parameter '%s' of shape %s",
+                    "loading tensor of shape %s into parameter '%s' of shape %s",
                     tensor.shape,
                     key,
                     param_shape,
@@ -2493,7 +2513,7 @@ class RemoteModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
-            model.load_weights(self._get_weights_iterator_fs(client))
+            _load_and_verify_weights(model, self._get_weights_iterator_fs(client))
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -2563,7 +2583,7 @@ def load_model_with_cpu_quantization(
         )
 
         if not isinstance(self, DummyModelLoader):
-            model.load_weights(self._get_all_weights(model_config, model))
+            _load_and_verify_weights(model, self._get_all_weights(model_config, model))
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
@@ -2579,6 +2599,110 @@ def load_model_with_cpu_quantization(
         model.to(target_device)
 
     return model.eval()
+
+
+class IncModelLoader(DefaultModelLoader):
+    """
+    Model loader that applies Intel AutoRound quantization
+    """
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+
+        logger.info("IncModelLoader: Loading model...")
+
+        # Check if model is already quantized
+        if model_config._is_already_quantized():
+            logger.info("Model is already quantized, loading directly...")
+            # Use default loading for pre-quantized models
+            return super().load_model(
+                model_config=model_config, device_config=device_config
+            )
+
+        quant_model = self._autoround_quantization_workflow(model_config, device_config)
+
+        target_device = torch.device(device_config.device)
+
+        # Return autoround model for offline quantization mode
+        if self.load_config.inc_save_path is not None:
+            quant_model.to(target_device)
+            return quant_model.eval()
+
+        model_config.hf_config = quant_model.config
+        quant_config = _get_quantization_config(model_config, self.load_config)
+
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    quant_config,
+                )
+
+            self.load_weights_and_postprocess(
+                model, iter(quant_model.state_dict().items()), target_device
+            )
+        return model.eval()
+
+    def _parse_quantization(self, quantization: str):
+        """Map quantization to AutoRound's scheme and format."""
+        AR_QUANT_CFG_CHOICES = {
+            "auto-round-int8": ("INT8", "llm_compressor"),
+        }
+        quant_cfg = AR_QUANT_CFG_CHOICES.get(quantization)
+        if not quant_cfg:
+            raise ValueError(
+                f"Invalid quantization choice: '{quantization}'. "
+                f"Available choices: {list(AR_QUANT_CFG_CHOICES.keys())}"
+            )
+        return quant_cfg
+
+    def _autoround_quantization_workflow(
+        self, model_config: ModelConfig, device_config: DeviceConfig
+    ) -> nn.Module:
+        """Auto-round quantization workflow: quantize, save checkpoint, then return model."""
+        try:
+            from auto_round import AutoRound
+        except ImportError:
+            logger.error(
+                "auto-round library not found. "
+                "Please install it using `pip install auto-round` to use AutoRound quantization."
+            )
+            raise
+
+        scheme, format = self._parse_quantization(model_config.quantization)
+
+        try:
+            autoround = AutoRound(
+                model_config.model_path,
+                scheme=scheme,
+                iters=self.load_config.inc_tuning_iters,
+                disable_opt_rtn=self.load_config.inc_disable_opt_rtn,
+                low_cpu_mem_usage=False,
+            )
+            if self.load_config.inc_save_path is not None:
+                logger.info("Offline quantization mode: Will quantize and save")
+                model, _ = autoround.quantize_and_save(
+                    output_dir=self.load_config.inc_save_path, format=format
+                )
+                return model
+            else:
+                logger.info("Online quantization mode: Will quantize and skip saving")
+                # Use a temporary directory and discard it so nothing is persisted in online mode.
+                with tempfile.TemporaryDirectory() as tmp_save_dir:
+                    model, _ = autoround.quantize_and_save(
+                        output_dir=tmp_save_dir, format=format
+                    )
+                return model
+        except Exception as e:
+            raise ValueError(f"AutoRound quantization failed: {e}")
 
 
 class ModelOptModelLoader(DefaultModelLoader):
@@ -3101,6 +3225,10 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
+
+    if model_config and model_config.quantization in ["auto-round-int8"]:
+        logger.info("Using IncModelLoader due to AutoRound quantization config.")
+        return IncModelLoader(load_config)
 
     # ModelOptModelLoader's local-copy quantize-and-export workflow doesn't apply
     # to non-local loaders. These loaders own their weight transport path and still

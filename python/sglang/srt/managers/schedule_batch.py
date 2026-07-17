@@ -1462,16 +1462,14 @@ class Req(ReqDllmMixin):
                 if not self._check_str_based_finish(new_accepted_len):
                     self._check_token_based_finish(new_accepted_tokens)
 
-        # The length cap wins only when it lands at or before the finish above (a
-        # stop past the cap, i.e. a spec chunk overshooting the budget, still
-        # finishes at the cap). finished_len is None for finishes that emit the
-        # full output (grammar / stop-token / decoded_text-only stop), so the cap
-        # applies to them when over budget, preserving the prior behavior.
+        # The length cap wins when it lands at or before the finish above. A
+        # concrete finished_len marks that finish boundary; finishes without one
+        # still yield to an overshot cap, preserving the prior behavior.
         max_new_tokens = self.sampling_params.max_new_tokens
         if len(self.output_ids) >= max_new_tokens and (
             not self.finished()
             or self.finished_len is None
-            or max_new_tokens < self.finished_len
+            or max_new_tokens <= self.finished_len
         ):
             self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
             self.finished_len = max_new_tokens

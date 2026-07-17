@@ -108,6 +108,13 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertEqual(type(req.finished_reason).__name__, "FINISH_LENGTH")
         self.assertEqual(req.finished_len, 3)
 
+    def test_stop_token_at_budget_preserves_length_precedence(self):
+        req = _make_req([10, 11, EOS_ID], eos_token_ids={EOS_ID}, max_new_tokens=3)
+        req.update_finish_state(new_accepted_len=1)
+        self.assertTrue(req.finished())
+        self.assertEqual(type(req.finished_reason).__name__, "FINISH_LENGTH")
+        self.assertEqual(req.finished_len, 3)
+
     def test_length_cap_only_when_no_stop(self):
         req = _make_req([10, 11, 12, 13, 14, 15], stop=["STOP"], max_new_tokens=4)
         req.update_finish_state(new_accepted_len=6)

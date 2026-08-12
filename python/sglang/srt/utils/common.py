@@ -86,7 +86,7 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -288,6 +288,15 @@ is_sm100_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
     )
 )
+# Datacenter Blackwell (SM100) plus SM110; excludes consumer Blackwell (SM120).
+# This is the arch set flash_attn.cute accepts for the absorbed-MLA qv argument.
+is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version,
+        device_capability_majors=[10, 11],
+        cuda_version=(12, 8),
+    )
+)
 is_sm80_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
@@ -298,6 +307,13 @@ is_sm90_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
     )
 )
+
+
+# GB10 (DGX Spark and OEM equivalents). Not expressible via
+# _check_cuda_device_version, which only matches on the major.
+@lru_cache(maxsize=1)
+def is_sm121() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
 
 
 try:
@@ -434,23 +450,9 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        # Use mem_get_info() with a sanity cap to avoid KV-cache over-allocation
-        # on drivers that incorrectly return total memory as free memory.
-        # Consistent with the fallback: free = max(0, total - allocated).
-        try:
-            free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
-            used_memory = float(torch.xpu.memory_allocated(gpu_id))
-            free_gpu_memory = min(
-                float(free_gpu_memory),
-                max(0.0, float(total_gpu_memory) - used_memory),
-            )
-        except Exception:
-            # Fallback for devices/drivers that do not support querying free memory
-            used_memory = float(torch.xpu.memory_allocated(gpu_id))
-            total_gpu_memory = float(
-                torch.xpu.get_device_properties(gpu_id).total_memory
-            )
-            free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
+        used_memory = torch.xpu.memory_allocated(gpu_id)
+        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
+        free_gpu_memory = total_gpu_memory - used_memory
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()
@@ -557,6 +559,18 @@ def get_dispatch_device_backend():
 @lru_cache(maxsize=1)
 def get_device_module():
     return torch.get_device_module()
+
+
+def create_device_stream(device):
+    """Create a device stream for the given device type."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).Stream(device=device)
+
+
+def device_stream_context(stream):
+    """Return the appropriate stream context manager for ``stream``."""
+    return torch.get_device_module(stream.device).stream(stream)
 
 
 def get_amdgpu_memory_capacity():
@@ -837,6 +851,18 @@ def get_device_name(device_id: int = 0) -> str:
 
 
 @lru_cache(maxsize=1)
+def is_mnnvl_fabric_device() -> bool:
+    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink), keyed on
+    the device name: the GB200/GB300 superchips. Used to auto-select
+    fabric-dependent communication paths (NCCL cuMem/MNNVL, custom all-reduce
+    v2 multinode, DCP fi_a2a)."""
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        return False
+    name = (torch.cuda.get_device_name(0) or "").upper()
+    return any(tag in name for tag in ("GB200", "GB300"))
+
+
+@lru_cache(maxsize=1)
 def is_habana_available() -> bool:
     return find_spec("habana_frameworks") is not None
 
@@ -997,21 +1023,11 @@ def set_cuda_arch():
         )
 
 
-def mxfp_supported():
-    """
-    Returns whether the current platform supports MX types.
-    """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
-        return False
-
-
 @lru_cache(maxsize=1)
 def is_gfx95_supported():
-    """
-    Returns whether the current platform supports MX types.
+    """Whether the device is an AMD gfx95 GPU (the MX-capable ROCm arch).
+
+    False on every non-HIP build, so callers do not need their own is_hip().
     """
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
@@ -1507,11 +1523,354 @@ def get_mm_http_session() -> requests.Session:
     return session
 
 
+# Raised by the loaders below when client-supplied media cannot be fetched or
+# decoded. ValueError is in the set because invalid base64 raises binascii.Error.
+CLIENT_MEDIA_EXCEPTIONS = (
+    ValueError,
+    UnidentifiedImageError,
+    requests.exceptions.RequestException,
+)
+
+
+class _AudioDecodeLimitError(ValueError):
+    """Audio exceeds a configured decode limit."""
+
+
+def _audio_too_long(duration_s: float, max_duration_s: float) -> _AudioDecodeLimitError:
+    return _AudioDecodeLimitError(
+        f"Audio exceeds the maximum allowed decode duration of "
+        f"{max_duration_s}s (input is at least {float(duration_s):.1f}s). Set "
+        f"SGLANG_MAX_AUDIO_DECODE_DURATION_S to change this limit."
+    )
+
+
+def _audio_too_large(
+    decoded_bytes: int, max_decode_bytes: int
+) -> _AudioDecodeLimitError:
+    return _AudioDecodeLimitError(
+        f"Audio exceeds the maximum allowed decoded size of {max_decode_bytes} "
+        f"bytes (input requires at least {decoded_bytes} bytes). Set "
+        f"SGLANG_MAX_AUDIO_DECODE_BYTES to change this limit."
+    )
+
+
+def _audio_decode_duration_limit(
+    max_duration_s: Optional[float],
+) -> Optional[float]:
+    if max_duration_s is None:
+        max_duration_s = envs.SGLANG_MAX_AUDIO_DECODE_DURATION_S.get()
+    try:
+        max_duration_s = float(max_duration_s)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "Maximum audio decode duration must be a finite number, got "
+            f"{max_duration_s!r}."
+        ) from error
+    if not math.isfinite(max_duration_s):
+        raise ValueError(
+            "Maximum audio decode duration must be a finite number, got "
+            f"{max_duration_s!r}."
+        )
+    return max_duration_s if max_duration_s > 0 else None
+
+
+def _audio_decode_byte_limit(max_decode_bytes: Optional[int]) -> Optional[int]:
+    if max_decode_bytes is None:
+        max_decode_bytes = envs.SGLANG_MAX_AUDIO_DECODE_BYTES.get()
+    if isinstance(max_decode_bytes, int):
+        parsed_value = max_decode_bytes
+    elif isinstance(max_decode_bytes, str):
+        try:
+            parsed_value = int(max_decode_bytes)
+        except ValueError as error:
+            raise ValueError(
+                "Maximum decoded audio bytes must be a finite integer, got "
+                f"{max_decode_bytes!r}."
+            ) from error
+    else:
+        try:
+            numeric_value = float(max_decode_bytes)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                "Maximum decoded audio bytes must be a finite integer, got "
+                f"{max_decode_bytes!r}."
+            ) from error
+        if not math.isfinite(numeric_value) or not numeric_value.is_integer():
+            raise ValueError(
+                "Maximum decoded audio bytes must be a finite integer, got "
+                f"{max_decode_bytes!r}."
+            )
+        parsed_value = int(numeric_value)
+    return parsed_value if parsed_value > 0 else None
+
+
+def _validate_audio_count(value: Optional[int], name: str, *, allow_zero: bool) -> int:
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(
+            f"{name} must be a {qualifier} integer, got {value}."
+        ) from error
+    minimum = 0 if allow_zero else 1
+    if (
+        not math.isfinite(numeric_value)
+        or not numeric_value.is_integer()
+        or numeric_value < minimum
+    ):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{name} must be a {qualifier} integer, got {value}.")
+    return int(numeric_value)
+
+
+def _validate_audio_sample_rate(sample_rate: Optional[int], name: str) -> int:
+    return _validate_audio_count(sample_rate, name, allow_zero=False)
+
+
+def _audio_duration_frame_count(
+    duration_s: float, sample_rate: int, *, round_up: bool = False
+) -> int:
+    duration_s = float(duration_s)
+    if not math.isfinite(duration_s) or duration_s < 0:
+        raise ValueError(
+            f"Audio duration must be a non-negative finite number, got {duration_s}."
+        )
+    sample_rate = _validate_audio_sample_rate(sample_rate, "Audio sample rate")
+    numerator, denominator = duration_s.as_integer_ratio()
+    frame_numerator = numerator * sample_rate
+    if round_up:
+        return (frame_numerator + denominator - 1) // denominator
+    return frame_numerator // denominator
+
+
+def _audio_resampled_frame_count(
+    frame_count: int, original_sr: int, target_sr: int
+) -> int:
+    frame_count = _validate_audio_count(
+        frame_count, "Audio frame count", allow_zero=True
+    )
+    original_sr = _validate_audio_sample_rate(original_sr, "Original sample rate")
+    target_sr = _validate_audio_sample_rate(target_sr, "Target sample rate")
+    return (frame_count * target_sr + original_sr - 1) // original_sr
+
+
+def _check_audio_pcm_size(
+    frame_count: int,
+    channels: int,
+    bytes_per_sample: int,
+    max_decode_bytes: Optional[int],
+) -> int:
+    frame_count = _validate_audio_count(
+        frame_count, "Audio frame count", allow_zero=True
+    )
+    channels = _validate_audio_count(channels, "Audio channel count", allow_zero=False)
+    bytes_per_sample = _validate_audio_count(
+        bytes_per_sample, "Audio sample size", allow_zero=False
+    )
+    decoded_bytes = frame_count * channels * bytes_per_sample
+    byte_cap = _audio_decode_byte_limit(max_decode_bytes)
+    if byte_cap is not None and decoded_bytes > byte_cap:
+        raise _audio_too_large(decoded_bytes, byte_cap)
+    return decoded_bytes
+
+
+def _check_audio_resample_size(
+    frame_count: int,
+    channels: int,
+    bytes_per_sample: int,
+    original_sr: int,
+    target_sr: int,
+    max_decode_bytes: Optional[int],
+) -> int:
+    output_frames = _audio_resampled_frame_count(frame_count, original_sr, target_sr)
+    _check_audio_pcm_size(output_frames, channels, bytes_per_sample, max_decode_bytes)
+    return output_frames
+
+
+def _decode_audio_with_torchcodec(
+    source,
+    *,
+    sample_rate: Optional[int] = None,
+    num_channels: Optional[int] = None,
+    max_duration_s: Optional[float] = None,
+    max_decode_bytes: Optional[int] = None,
+):
+    duration_cap = _audio_decode_duration_limit(max_duration_s)
+    byte_cap = _audio_decode_byte_limit(max_decode_bytes)
+
+    from torchcodec.decoders import AudioDecoder
+
+    decoder_kwargs = {}
+    if sample_rate is not None:
+        decoder_kwargs["sample_rate"] = _validate_audio_sample_rate(
+            sample_rate, "Requested sample rate"
+        )
+    if num_channels is not None:
+        decoder_kwargs["num_channels"] = _validate_audio_count(
+            num_channels, "Requested channel count", allow_zero=False
+        )
+    decoder = AudioDecoder(source, **decoder_kwargs)
+
+    if duration_cap is None and byte_cap is None:
+        return decoder.get_all_samples()
+
+    metadata = decoder.metadata
+    decoded_sr = _validate_audio_sample_rate(
+        (
+            sample_rate
+            if sample_rate is not None
+            else getattr(metadata, "sample_rate", None)
+        ),
+        "Decoded sample rate",
+    )
+    decoded_channels = _validate_audio_count(
+        (
+            num_channels
+            if num_channels is not None
+            else getattr(metadata, "num_channels", None)
+        ),
+        "Decoded channel count",
+        allow_zero=False,
+    )
+    bytes_per_frame = decoded_channels * np.dtype(np.float32).itemsize
+
+    metadata_duration_s = getattr(metadata, "duration_seconds", None)
+    if metadata_duration_s is not None:
+        try:
+            metadata_duration_s = float(metadata_duration_s)
+        except (TypeError, ValueError, OverflowError):
+            metadata_duration_s = None
+        if metadata_duration_s is not None and (
+            not math.isfinite(metadata_duration_s) or metadata_duration_s < 0
+        ):
+            metadata_duration_s = None
+
+    metadata_frames = None
+    if metadata_duration_s is not None:
+        # Metadata is only a fast-reject hint. Use a lower bound here because
+        # floating duration values can sit just above an exact frame boundary;
+        # the requested-range output below is the authoritative check.
+        metadata_frames = _audio_duration_frame_count(metadata_duration_s, decoded_sr)
+        if duration_cap is not None:
+            duration_frame_limit = _audio_duration_frame_count(duration_cap, decoded_sr)
+            if metadata_frames > duration_frame_limit:
+                raise _audio_too_long(metadata_frames / decoded_sr, duration_cap)
+        metadata_bytes = metadata_frames * bytes_per_frame
+        if byte_cap is not None and metadata_bytes > byte_cap:
+            raise _audio_too_large(metadata_bytes, byte_cap)
+
+    allowed_frame_limit = None
+    byte_frame_limit = None
+    if duration_cap is not None:
+        allowed_frame_limit = _audio_duration_frame_count(duration_cap, decoded_sr)
+    if byte_cap is not None:
+        byte_frame_limit = byte_cap // bytes_per_frame
+        if byte_frame_limit == 0:
+            raise _audio_too_large(bytes_per_frame, byte_cap)
+        if allowed_frame_limit is None or byte_frame_limit < allowed_frame_limit:
+            allowed_frame_limit = byte_frame_limit
+
+    assert allowed_frame_limit is not None
+    # Decode one frame beyond the active boundary. An exact-size result is only
+    # accepted when the decoder reaches EOF instead of silently truncating at
+    # potentially inaccurate container metadata.
+    decode_frame_limit = allowed_frame_limit + 1
+    samples = decoder.get_samples_played_in_range(
+        0.0, stop_seconds=decode_frame_limit / decoded_sr
+    )
+    actual_sr = _validate_audio_sample_rate(samples.sample_rate, "Decoded sample rate")
+    if actual_sr != decoded_sr:
+        raise ValueError(
+            f"Decoded sample rate changed from {decoded_sr} to {actual_sr}."
+        )
+    actual_frames = samples.data.shape[-1]
+    duration_s = actual_frames / actual_sr
+    if duration_cap is not None and duration_s > duration_cap:
+        raise _audio_too_long(duration_s, duration_cap)
+    actual_bytes = samples.data.numel() * samples.data.element_size()
+    if byte_cap is not None and actual_bytes > byte_cap:
+        raise _audio_too_large(actual_bytes, byte_cap)
+    return samples
+
+
+def _decode_audio_with_soundfile(
+    source: str | bytes,
+    *,
+    max_duration_s: Optional[float] = None,
+    max_decode_bytes: Optional[int] = None,
+    dtype: Optional[str] = None,
+) -> tuple[np.ndarray, int]:
+    import soundfile as sf
+
+    duration_cap = _audio_decode_duration_limit(max_duration_s)
+    byte_cap = _audio_decode_byte_limit(max_decode_bytes)
+    audio_input = BytesIO(source) if isinstance(source, bytes) else source
+    read_kwargs = {"dtype": dtype} if dtype is not None else {}
+    decode_dtype = np.dtype(dtype if dtype is not None else "float64")
+    try:
+        with sf.SoundFile(audio_input) as audio_file:
+            original_sr = _validate_audio_sample_rate(
+                audio_file.samplerate, "Audio file sample rate"
+            )
+            channels = _validate_audio_count(
+                audio_file.channels, "Audio file channel count", allow_zero=False
+            )
+            frames = _validate_audio_count(
+                audio_file.frames, "Audio file frame count", allow_zero=True
+            )
+            duration_frame_limit = (
+                _audio_duration_frame_count(duration_cap, original_sr)
+                if duration_cap is not None
+                else None
+            )
+            if duration_frame_limit is not None and frames > duration_frame_limit:
+                raise _audio_too_long(frames / original_sr, duration_cap)
+            decoded_bytes = frames * channels * decode_dtype.itemsize
+            if byte_cap is not None and decoded_bytes > byte_cap:
+                raise _audio_too_large(decoded_bytes, byte_cap)
+            if byte_cap is not None and channels * decode_dtype.itemsize > byte_cap:
+                raise _audio_too_large(channels * decode_dtype.itemsize, byte_cap)
+
+            if duration_cap is None and byte_cap is None:
+                audio = audio_file.read(**read_kwargs)
+            else:
+                byte_frame_limit = (
+                    byte_cap // (channels * decode_dtype.itemsize)
+                    if byte_cap is not None
+                    else None
+                )
+                limits = [
+                    limit
+                    for limit in (duration_frame_limit, byte_frame_limit)
+                    if limit is not None
+                ]
+                # One additional frame is the EOF proof for an exact-boundary
+                # input. The temporary overshoot is at most one PCM frame.
+                audio = audio_file.read(frames=min(limits) + 1, **read_kwargs)
+            if duration_frame_limit is not None and len(audio) > duration_frame_limit:
+                raise _audio_too_long(len(audio) / original_sr, duration_cap)
+            if byte_cap is not None and audio.nbytes > byte_cap:
+                raise _audio_too_large(audio.nbytes, byte_cap)
+    except sf.LibsndfileError as error:
+        raise ValueError(f"Could not decode audio: {error}") from error
+    return audio, original_sr
+
+
 def load_audio(
-    audio_file: str, sr: Optional[int] = None, mono: bool = True
+    audio_file: str | bytes,
+    sr: Optional[int] = None,
+    mono: bool = True,
+    max_duration_s: Optional[float] = None,
+    max_decode_bytes: Optional[int] = None,
 ) -> np.ndarray:
     if sr is None:
         sr = 16000
+    else:
+        sr = _validate_audio_sample_rate(sr, "Sample rate")
+    # A small compressed payload can expand into hours or gigabytes of PCM.
+    # The limits compose, and <= 0 disables either one independently.
+    duration_cap = _audio_decode_duration_limit(max_duration_s)
+    byte_cap = _audio_decode_byte_limit(max_decode_bytes)
 
     # Normalize input: resolve URL / base64 / file:// to bytes or path
     if isinstance(audio_file, bytes):
@@ -1532,40 +1891,72 @@ def load_audio(
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
-    if _BACKEND == "torchcodec":
-        from torchcodec.decoders import AudioDecoder
+    from sglang.srt.multimodal.audio_from_video import (
+        decode_audio_container,
+        is_audio_container,
+    )
 
+    if isinstance(source, bytes):
+        header = source[:16]
+    else:
+        with open(source, "rb") as audio_stream:
+            header = audio_stream.read(16)
+
+    if is_audio_container(header):
+        return decode_audio_container(
+            source,
+            target_sr=sr,
+            mono=mono,
+            max_duration_s=duration_cap if duration_cap is not None else 0.0,
+            max_decode_bytes=byte_cap if byte_cap is not None else 0,
+        )
+
+    if _BACKEND == "torchcodec":
         try:
-            decoder = AudioDecoder(
+            samples = _decode_audio_with_torchcodec(
                 source,
                 sample_rate=sr,
                 num_channels=1 if mono else None,
+                max_duration_s=duration_cap if duration_cap is not None else 0.0,
+                max_decode_bytes=byte_cap if byte_cap is not None else 0,
             )
-            samples = decoder.get_all_samples()
+        except _AudioDecodeLimitError:
+            raise
+        except Exception as e:
+            # torchcodec's bytes-buffer IO can fail on WAV files that carry
+            # large trailing metadata chunks. Fall back to soundfile, which
+            # reads the PCM payload directly.
+            logger.warning(
+                f"torchcodec decode failed ({e}); falling back to soundfile + torchaudio."
+            )
+        else:
             if mono:
                 return samples.data.squeeze(0).numpy()
             return samples.data.T.numpy()
-        except Exception as e:
-            # torchcodec's bytes-buffer IO can fail on WAV files that carry
-            # large trailing metadata chunks. Fall back to soundfile, which reads the PCM payload directly.
-            logger.warning(
-                f"torchcodec AudioDecoder failed ({e}); falling back to soundfile + torchaudio."
-            )
 
     # Fallback: soundfile + torchaudio (ARM / no FFmpeg / torchcodec failure)
-    import soundfile as sf
     import torch
     import torchaudio
 
-    if isinstance(source, bytes):
-        audio, original_sr = sf.read(BytesIO(source))
-    else:
-        audio, original_sr = sf.read(source)
+    audio, original_sr = _decode_audio_with_soundfile(
+        source,
+        max_duration_s=duration_cap if duration_cap is not None else 0.0,
+        max_decode_bytes=byte_cap if byte_cap is not None else 0,
+    )
 
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
 
     if original_sr != sr:
+        channels = 1 if audio.ndim == 1 else audio.shape[1]
+        _check_audio_resample_size(
+            len(audio),
+            channels,
+            np.dtype(np.float32).itemsize,
+            original_sr,
+            sr,
+            byte_cap if byte_cap is not None else 0,
+        )
         audio_tensor = torch.from_numpy(audio).float()
         if audio_tensor.dim() == 1:
             audio_tensor = audio_tensor.unsqueeze(0)
@@ -1578,6 +1969,12 @@ def load_audio(
             audio = audio_tensor.squeeze(0).numpy()
         else:
             audio = audio_tensor.T.numpy()
+        _check_audio_pcm_size(
+            len(audio),
+            1 if audio.ndim == 1 else audio.shape[1],
+            audio.dtype.itemsize,
+            byte_cap if byte_cap is not None else 0,
+        )
 
     return audio
 
@@ -1597,9 +1994,12 @@ class VideoData:
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
 
 
-def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -> bool:
+def is_jpeg_with_cuda(
+    image_bytes: bytes = b"", gpu_image_decode: GPUImageDecodeMode = True
+) -> bool:
     """
     Check three conditions:
     1. whether CUDA is available.
@@ -1613,10 +2013,19 @@ def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -
     return False
 
 
+@lru_cache(maxsize=16)
+def _warn_fancy_jpeg_fallback(error: str) -> None:
+    logger.warning(
+        "High-fidelity GPU JPEG decode is unavailable; falling back to PIL. "
+        "Install the Kimi-K3 serving image or NVIDIA nvImageCodec. Error: %s",
+        error,
+    )
+
+
 def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
-    gpu_image_decode: bool = True,
+    gpu_image_decode: GPUImageDecodeMode = True,
 ) -> Union[torch.Tensor, Image.Image]:
     """
     Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
@@ -1627,19 +2036,29 @@ def _load_image(
         image_bytes = get_image_bytes(image_file)
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
+            if gpu_image_decode == "nvjpeg_fancy":
+                from sglang.srt.utils.nvjpeg_decoder import (
+                    decode_jpeg_with_fancy_upsampling,
+                )
+
+                return decode_jpeg_with_fancy_upsampling(image_bytes)
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
         except Exception as e:
-            logger.warning(
-                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
-            )
+            if gpu_image_decode == "nvjpeg_fancy":
+                _warn_fancy_jpeg_fallback(f"{type(e).__name__}: {e}")
+            else:
+                logger.warning(
+                    "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
+                    e,
+                )
     return Image.open(BytesIO(image_bytes))
 
 
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
-    gpu_image_decode: bool = True,
+    gpu_image_decode: GPUImageDecodeMode = True,
 ) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
     """
     Load image from multiple input formats, including:
@@ -1733,6 +2152,20 @@ def _normalize_video_input(
         return None
 
 
+def get_video_bytes(video_file: Union[str, bytes, VideoData]) -> bytes:
+    """Normalize a video input and return its encoded bytes."""
+    if isinstance(video_file, VideoData):
+        video_file = video_file.url
+
+    source = _normalize_video_input(video_file)
+    if isinstance(source, bytes):
+        return source
+    if isinstance(source, str):
+        with open(source, "rb") as f:
+            return f.read()
+    raise ValueError(f"Unsupported video input type: {type(video_file)}")
+
+
 def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     if isinstance(video_file, VideoData):
         # preprocess_kwargs is consumed by the multimodal processor, not here.
@@ -1746,7 +2179,13 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
     device = "cuda" if use_gpu else "cpu"
-    return VideoDecoderWrapper(source, device=device)
+    try:
+        return VideoDecoderWrapper(source, device=device)
+    except (ImportError, MemoryError):
+        raise  # missing backend / OOM is not a bad payload
+    except Exception as e:
+        # Broad on purpose: torchcodec raises RuntimeError, decord its own type.
+        raise ValueError(f"Could not decode video: {e}") from e
 
 
 def sample_video_frames(video, *, desired_fps: int, max_frames: int) -> list[int]:
@@ -1820,12 +2259,16 @@ def suppress_noisy_warnings():
     cutlass_dsl_noisy = {
         (
             DeprecationWarning,
-            "Use explicit `struct.scalar.ptr` for pointer instead.",
+            "Using `struct.scalar` as pointer is deprecated.",
         ),
         (
             UserWarning,
             "NamedBarrier wait also arrives on the barrier. "
             "Routing call to NamedBarrier.arrive_and_wait().",
+        ),
+        (
+            DeprecationWarning,
+            "builtin type swigvarlink has no __module__ attribute",
         ),
     }
     for cat, msg in cutlass_dsl_noisy:
@@ -1907,7 +2350,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.14")
+        min_version: Minimum version required (e.g., "0.6.15.post1")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -2329,25 +2772,30 @@ class RefCountedGauge:
                 self._gauge.dec()
 
 
-def add_prometheus_track_response_middleware(app):
+def add_prometheus_track_response_middleware(
+    app, extra_labels: Optional[Dict[str, str]] = None
+):
     from prometheus_client import Counter, Gauge
+
+    extra_labels = extra_labels or {}
+    extra_label_names = list(extra_labels.keys())
 
     http_request_counter = Counter(
         name="sglang:http_requests_total",
         documentation="Total number of HTTP requests by endpoint and method",
-        labelnames=["endpoint", "method"],
+        labelnames=extra_label_names + ["endpoint", "method"],
     )
 
     http_response_counter = Counter(
         name="sglang:http_responses_total",
         documentation="Total number of HTTP responses by endpoint and status code",
-        labelnames=["endpoint", "status_code", "method"],
+        labelnames=extra_label_names + ["endpoint", "status_code", "method"],
     )
 
     http_requests_active = Gauge(
         name="sglang:http_requests_active",
         documentation="Number of currently active HTTP requests",
-        labelnames=["endpoint", "method"],
+        labelnames=extra_label_names + ["endpoint", "method"],
         multiprocess_mode="livesum",
     )
 
@@ -2373,8 +2821,8 @@ def add_prometheus_track_response_middleware(app):
         method = request.method
         routing_key = request.headers.get("x-smg-routing-key")
 
-        http_request_counter.labels(endpoint=path, method=method).inc()
-        http_requests_active.labels(endpoint=path, method=method).inc()
+        http_request_counter.labels(**extra_labels, endpoint=path, method=method).inc()
+        http_requests_active.labels(**extra_labels, endpoint=path, method=method).inc()
         if routing_key:
             routing_keys_active.inc(routing_key)
 
@@ -2382,6 +2830,7 @@ def add_prometheus_track_response_middleware(app):
             response = await call_next(request)
 
             http_response_counter.labels(
+                **extra_labels,
                 endpoint=path,
                 method=method,
                 status_code=str(response.status_code),
@@ -2389,7 +2838,9 @@ def add_prometheus_track_response_middleware(app):
 
             return response
         finally:
-            http_requests_active.labels(endpoint=path, method=method).dec()
+            http_requests_active.labels(
+                **extra_labels, endpoint=path, method=method
+            ).dec()
             if routing_key:
                 routing_keys_active.dec(routing_key)
 
@@ -2401,7 +2852,7 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     for route in request.app.routes:
         match, child_scope = route.matches(request.scope)
         if match == Match.FULL:
-            return route.path, True
+            return getattr(route, "path", request.url.path), True
 
     return request.url.path, False
 
@@ -2748,6 +3199,7 @@ class SafeUnpickler(pickle.Unpickler):
         # --- SGLang & Unitest ---
         "sglang.srt.weight_sync.tensor_bucket.",
         "sglang.srt.model_executor.model_runner.",
+        "sglang.srt.model_executor.model_runner_components.weight_updater.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
         "sglang.srt.disaggregation.",
@@ -3426,14 +3878,17 @@ def dispose_tensor(x: torch.Tensor):
     interfering with torch.compile's memory tracking and graph recording.
     """
 
-    # Skip disposal during piecewise CUDA graph capture/replay: freeing the
-    # backing storage would invalidate addresses recorded in the graph.
-    # Local import avoids a circular dependency.
+    # Skip disposal under a captured prefill graph (piecewise or breakable):
+    # freeing the backing storage would invalidate addresses recorded in the
+    # graph. Local imports avoid a circular dependency.
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph,
+    )
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         is_in_tc_piecewise_cuda_graph,
     )
 
-    if is_in_tc_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return
 
     from sglang.srt.runtime_context import get_flags
@@ -3471,14 +3926,23 @@ def require_mlp_tp_gather(server_args: ServerArgs):
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
-    if server_args.enable_dp_attention:
-        assert server_args.dp_size > 1, "dp_size must be greater than 1"
+    # elastic-EP scale-up rewrites dp_size on the published config
+    if get_parallel().enable_dp_attention:
+        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
+        if get_exec().moe.elastic_ep_backend is not None:
+            from sglang.srt.elastic_ep.elastic_ep import (
+                elastic_expanded_world_enabled,
+            )
+
+            if elastic_expanded_world_enabled():
+                return True
         if (
-            server_args.moe_dense_tp_size is None
+            get_parallel().moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
             return True
-        elif not server_args.enable_dp_lm_head:
+        elif not get_parallel().enable_dp_lm_head:
             return True
         elif get_moe_a2a_backend().is_none():
             return True
@@ -3494,8 +3958,8 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             return True
         else:
             return (
-                server_args.moe_dense_tp_size
-                > server_args.tp_size // server_args.dp_size
+                get_parallel().moe_dense_tp_size
+                > server_args.tp_size // get_parallel().dp_size
             )
     else:
         return False
@@ -3509,14 +3973,19 @@ def require_attn_tp_gather(server_args: ServerArgs):
     # and do not consume the upstream gathered_buffer. Without this, the
     # cuda graph runner pads num_tokens to attn_tp_size, which can cause
     # autotuners to pick suboptimal kernel variants at small batches.
-    if server_args.disable_attn_tp_gather:
+    from sglang.srt.runtime_context import get_parallel
+
+    if get_parallel().disable_attn_tp_gather:
         return False
 
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size is not None:
-        if server_args.enable_dp_attention:
-            return server_args.dp_size < server_args.tp_size
+    if (
+        not get_moe_a2a_backend().is_none()
+        or get_parallel().moe_dense_tp_size is not None
+    ):
+        if get_parallel().enable_dp_attention:
+            return get_parallel().dp_size < server_args.tp_size
         else:
             return True
     else:
@@ -3528,7 +3997,34 @@ def require_gathered_buffer(server_args: ServerArgs):
 
 
 def require_mlp_sync(server_args: ServerArgs):
-    return server_args.enable_dp_attention or require_gathered_buffer(server_args)
+    from sglang.srt.runtime_context import get_parallel
+
+    return get_parallel().enable_dp_attention or require_gathered_buffer(server_args)
+
+
+def get_cuda_graph_batch_size_alignment(server_args: ServerArgs) -> int:
+    alignment = 1
+    if server_args.enable_two_batch_overlap:
+        alignment *= 2
+    if require_gathered_buffer(server_args):
+        alignment *= get_parallel().attn_tp_size
+    if alignment % get_parallel().attn_cp_size != 0:
+        alignment *= get_parallel().attn_cp_size
+    return alignment
+
+
+def get_cuda_graph_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
+    return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment(server_args))
+
+
+def get_eager_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
+    if not require_mlp_sync(server_args):
+        return max_batch_size
+
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+    max_batch_size = ceil_align(max_batch_size, get_parallel().attn_tp_size)
+    return ceil_align(max_batch_size, get_cp_padding_align_size())
 
 
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
@@ -4043,6 +4539,9 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "gate_up_proj",
     "embed_tokens",
     "lm_head",
+    # Inkling attention projections (merged q/k/v/r and its row-parallel output).
+    "qkvr",
+    "wo_ud",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
@@ -4136,15 +4635,7 @@ class ConcurrentCounter:
 
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
-    if importlib.util.find_spec("triton_kernels") is None:
-        return False
-    try:
-        ragged_metadata_spec = importlib.util.find_spec(
-            "triton_kernels.tensor_details.ragged_tensor"
-        )
-    except ModuleNotFoundError:
-        return False
-    return ragged_metadata_spec is not None
+    return importlib.util.find_spec("triton_kernels") is not None
 
 
 def json_list_type(value):
@@ -4408,3 +4899,13 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+def init_cublas():
+    """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+    dtype = torch.float16
+    device = "cuda"
+    a = torch.ones((16, 16), dtype=dtype, device=device)
+    b = torch.ones((16, 16), dtype=dtype, device=device)
+    c = a @ b
+    return c

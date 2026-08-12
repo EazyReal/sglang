@@ -1,4 +1,3 @@
-import ast
 import json
 import re
 from enum import Enum, auto
@@ -12,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import safe_literal_eval
 
 
 class _ParseState(Enum):
@@ -50,7 +50,7 @@ class PoolsideV1Detector(BaseFormatDetector):
     String values are emitted as raw text; non-strings are JSON-encoded by
     the chat template. The parser does schema-based type coercion to round-trip
     them: schema type `string` keeps the raw value; other types attempt
-    `json.loads` and fall back to `ast.literal_eval`, then to the raw string.
+    `json.loads` and fall back to `safe_literal_eval`, then to the raw string.
     """
 
     # Wire-format tag tokens — constants, not per-instance.
@@ -166,27 +166,23 @@ class PoolsideV1Detector(BaseFormatDetector):
           - no schema entry           → json.loads only (conservative; don't
                                         ast-eval untyped values)
           - everything else (int,
-            number, bool, object, …)  → json.loads, then ast.literal_eval
+            number, bool, object, …)  → json.loads, then safe_literal_eval
 
-        Each decoder result is round-tripped through `json.dumps` before being
-        returned; non-JSON-serializable values (sets / complex / bytes from
-        `ast.literal_eval`) are rejected to the next decoder, ultimately
-        falling through to the raw-string fallback rather than crashing the
-        streaming JSON emission downstream.
+        Each decoder result is encoded with `allow_nan=False` before being
+        returned. Non-JSON values and non-finite numbers are rejected to the
+        next decoder, then to the raw-string fallback.
         """
         spec = schema.get(key) if isinstance(schema, dict) else None
         param_type = str(spec.get("type", "")).lower() if isinstance(spec, dict) else ""
         if param_type in PoolsideV1Detector._STRING_TYPES:
             return raw
 
-        decoders = (json.loads,) if not param_type else (json.loads, ast.literal_eval)
+        decoders = (json.loads,) if not param_type else (json.loads, safe_literal_eval)
         for decoder in decoders:
             try:
                 result = decoder(raw)
-                # ast.literal_eval can return non-JSON-serializable values
-                # (sets, complex numbers); reject so json.dumps downstream
-                # doesn't choke.
-                json.dumps(result)
+                # Reject values that downstream cannot encode as standard JSON.
+                json.dumps(result, allow_nan=False)
                 return result
             except (ValueError, SyntaxError, TypeError):
                 continue
